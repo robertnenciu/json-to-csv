@@ -8,12 +8,12 @@ import sys
 import json
 import csv
 from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Union, Tuple
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QTextEdit, QMessageBox, QProgressBar,
-    QTabWidget, QPlainTextEdit
+    QTabWidget, QPlainTextEdit, QCheckBox, QSpinBox, QGroupBox
 )
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QFont
@@ -57,16 +57,17 @@ class JsonToCsvConverter:
         return dict(items)
     
     @staticmethod
-    def json_to_csv(json_data: Union[List[Dict], Dict], output_path: Path) -> bool:
+    def json_to_csv(json_data: Union[List[Dict], Dict], output_path: Path, max_rows_per_file: int = None) -> Tuple[bool, int, str]:
         """
-        Convert JSON data to CSV file with proper comma handling.
+        Convert JSON data to CSV file(s) with proper comma handling.
         
         Args:
             json_data: JSON data (list of dicts or single dict)
-            output_path: Path to save CSV file
+            output_path: Path to save CSV file(s)
+            max_rows_per_file: Maximum rows per file. If None, creates a single file.
             
         Returns:
-            True if successful, False otherwise
+            Tuple of (success: bool, num_files: int, message: str)
         """
         try:
             # Normalize input to list of dicts
@@ -90,28 +91,95 @@ class JsonToCsvConverter:
                     if key not in ordered_keys:
                         ordered_keys.append(key)
             
-            # Write CSV with proper comma handling
-            # The csv module automatically handles commas in values by quoting
-            with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
-                writer = csv.DictWriter(
-                    csvfile,
-                    fieldnames=ordered_keys,
-                    delimiter=',',
-                    quotechar='"',
-                    quoting=csv.QUOTE_ALL,  # ensure all fields are quoted for loaders that expect it
-                )
-                writer.writeheader()
-                
-                for record in flattened_records:
-                    # Fill missing keys with empty strings
-                    complete_record = {key: record.get(key, '') for key in ordered_keys}
-                    writer.writerow(complete_record)
+            total_records = len(flattened_records)
             
-            return True
+            # If max_rows_per_file is set and we have more records, split into multiple files
+            if max_rows_per_file and max_rows_per_file > 0 and total_records > max_rows_per_file:
+                return JsonToCsvConverter._write_split_csv(
+                    flattened_records, ordered_keys, output_path, max_rows_per_file
+                )
+            else:
+                # Write single CSV file
+                with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
+                    writer = csv.DictWriter(
+                        csvfile,
+                        fieldnames=ordered_keys,
+                        delimiter=',',
+                        quotechar='"',
+                        quoting=csv.QUOTE_ALL,
+                    )
+                    writer.writeheader()
+                    
+                    for record in flattened_records:
+                        complete_record = {key: record.get(key, '') for key in ordered_keys}
+                        writer.writerow(complete_record)
+                
+                return True, 1, f"Created 1 CSV file with {total_records} rows"
             
         except Exception as e:
             print(f"Error converting JSON to CSV: {e}")
-            return False
+            return False, 0, str(e)
+    
+    @staticmethod
+    def _write_split_csv(flattened_records: List[Dict], ordered_keys: List[str], 
+                        output_path: Path, max_rows_per_file: int) -> Tuple[bool, int, str]:
+        """
+        Write CSV data split across multiple files.
+        
+        Args:
+            flattened_records: List of flattened record dictionaries
+            ordered_keys: Ordered list of column keys
+            output_path: Base path for output files
+            max_rows_per_file: Maximum rows per file
+            
+        Returns:
+            Tuple of (success: bool, num_files: int, message: str)
+        """
+        try:
+            total_records = len(flattened_records)
+            num_files = (total_records + max_rows_per_file - 1) // max_rows_per_file  # Ceiling division
+            
+            # Get base path components
+            base_dir = output_path.parent
+            base_name = output_path.stem
+            base_ext = output_path.suffix
+            
+            created_files = []
+            
+            for file_num in range(1, num_files + 1):
+                start_idx = (file_num - 1) * max_rows_per_file
+                end_idx = min(start_idx + max_rows_per_file, total_records)
+                
+                # Generate filename: base_1.csv, base_2.csv, etc.
+                if num_files > 1:
+                    file_path = base_dir / f"{base_name}_{file_num}{base_ext}"
+                else:
+                    file_path = output_path
+                
+                # Write this chunk to a file
+                with open(file_path, 'w', newline='', encoding='utf-8') as csvfile:
+                    writer = csv.DictWriter(
+                        csvfile,
+                        fieldnames=ordered_keys,
+                        delimiter=',',
+                        quotechar='"',
+                        quoting=csv.QUOTE_ALL,
+                    )
+                    writer.writeheader()
+                    
+                    for i in range(start_idx, end_idx):
+                        record = flattened_records[i]
+                        complete_record = {key: record.get(key, '') for key in ordered_keys}
+                        writer.writerow(complete_record)
+                
+                created_files.append(file_path.name)
+            
+            file_list = ", ".join(created_files)
+            return True, num_files, f"Created {num_files} CSV file(s) with {total_records} total rows: {file_list}"
+            
+        except Exception as e:
+            print(f"Error writing split CSV files: {e}")
+            return False, 0, str(e)
 
 
 class ConversionThread(QThread):
@@ -119,22 +187,25 @@ class ConversionThread(QThread):
     
     finished = Signal(bool, str)  # success, message
     
-    def __init__(self, json_data: Any, csv_path: Path, source_name: str = "JSON"):
+    def __init__(self, json_data: Any, csv_path: Path, source_name: str = "JSON", max_rows_per_file: int = None):
         super().__init__()
         self.json_data = json_data
         self.csv_path = csv_path
         self.source_name = source_name
+        self.max_rows_per_file = max_rows_per_file
     
     def run(self):
         """Perform the conversion in a separate thread."""
         try:
             # Convert to CSV
-            success = JsonToCsvConverter.json_to_csv(self.json_data, self.csv_path)
+            success, num_files, message = JsonToCsvConverter.json_to_csv(
+                self.json_data, self.csv_path, self.max_rows_per_file
+            )
             
             if success:
-                self.finished.emit(True, f"Successfully converted {self.source_name} to {self.csv_path}")
+                self.finished.emit(True, message)
             else:
-                self.finished.emit(False, "Conversion failed. Check console for details.")
+                self.finished.emit(False, f"Conversion failed: {message}")
                 
         except json.JSONDecodeError as e:
             self.finished.emit(False, f"Invalid JSON: {e}")
@@ -230,6 +301,36 @@ class JsonToCsvWindow(QMainWindow):
         self.input_tabs.currentChanged.connect(self.on_tab_changed)
         
         layout.addWidget(self.input_tabs)
+        
+        # Split options group
+        split_group = QGroupBox("Split Options (for large files)")
+        split_layout = QVBoxLayout()
+        split_group.setLayout(split_layout)
+        
+        # Enable split checkbox
+        self.split_checkbox = QCheckBox("Split into multiple CSV files")
+        self.split_checkbox.setToolTip("Enable this to split large JSON files into multiple CSV files")
+        split_layout.addWidget(self.split_checkbox)
+        
+        # Max rows per file
+        rows_layout = QHBoxLayout()
+        rows_label = QLabel("Max rows per file:")
+        self.max_rows_spinbox = QSpinBox()
+        self.max_rows_spinbox.setMinimum(1)
+        self.max_rows_spinbox.setMaximum(10000000)  # 10 million max
+        self.max_rows_spinbox.setValue(100000)  # Default: 100k rows
+        self.max_rows_spinbox.setEnabled(False)
+        self.max_rows_spinbox.setToolTip("Maximum number of rows per CSV file (excluding header)")
+        
+        # Connect checkbox to enable/disable spinbox
+        self.split_checkbox.toggled.connect(self.max_rows_spinbox.setEnabled)
+        
+        rows_layout.addWidget(rows_label)
+        rows_layout.addWidget(self.max_rows_spinbox)
+        rows_layout.addStretch()
+        split_layout.addLayout(rows_layout)
+        
+        layout.addWidget(split_group)
         
         # Convert button
         self.convert_btn = QPushButton("Convert to CSV")
@@ -351,6 +452,10 @@ class JsonToCsvWindow(QMainWindow):
                 QMessageBox.critical(self, "Error", f"Error parsing JSON: {str(e)}")
                 return
         
+        # Get split options
+        enable_split = self.split_checkbox.isChecked()
+        max_rows = self.max_rows_spinbox.value() if enable_split else None
+        
         # Get output file path
         if current_tab == 0 and self.json_file_path:
             default_name = self.json_file_path.stem + ".csv"
@@ -359,9 +464,11 @@ class JsonToCsvWindow(QMainWindow):
             default_name = "output.csv"
             default_dir = ""
         
+        dialog_title = "Save CSV File(s)" if enable_split else "Save CSV File"
+        
         output_path, _ = QFileDialog.getSaveFileName(
             self,
-            "Save CSV File",
+            dialog_title,
             default_dir + "/" + default_name if default_dir else default_name,
             "CSV Files (*.csv);;All Files (*)"
         )
@@ -375,10 +482,14 @@ class JsonToCsvWindow(QMainWindow):
         self.convert_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)  # Indeterminate progress
-        self.add_status(f"Converting {source_name} to CSV...")
+        
+        if enable_split and max_rows:
+            self.add_status(f"Converting {source_name} to CSV (splitting at {max_rows:,} rows per file)...")
+        else:
+            self.add_status(f"Converting {source_name} to CSV...")
         
         # Start conversion in separate thread
-        self.conversion_thread = ConversionThread(json_data, output_path, source_name)
+        self.conversion_thread = ConversionThread(json_data, output_path, source_name, max_rows)
         self.conversion_thread.finished.connect(self.on_conversion_finished)
         self.conversion_thread.start()
     
